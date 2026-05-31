@@ -1,13 +1,12 @@
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionServer
+from sensor_msgs.msg import Image, RegionOfInterest
+from cv_bridge import CvBridge
 from ultralytics import YOLO
-import rospy
-from actionlib import SimpleActionServer
-from sensor_msgs.msg import Image
-from sensor_msgs.msg import RegionOfInterest
-from cv_bridge import CvBridge, CvBridgeError
-from robokudo_msgs.msg import GenericImgProcAnnotatorResult, GenericImgProcAnnotatorAction
-import ros_numpy
-
+from robokudo_msgs.action import GenericImgProcAnnotator
 import numpy as np
+
 
 import argparse
 import os
@@ -46,7 +45,7 @@ names_mapping_tracebotcanister = {
     "fluidcontainer": "obj_000001",
 }
 
-class YOLOv8:
+class YOLOv8(Node):
     def __init__(
             self,
             weights='yolov8s.pt',  # model path or triton URL
@@ -59,6 +58,7 @@ class YOLOv8:
             camera_topic='/camera/color/image_raw',
                 ):
 
+        super().__init__('yolo_node')
         self.img_size = imgsz
         self.conf_thres= conf_thres
         self.iou_thres = iou_thres
@@ -74,28 +74,30 @@ class YOLOv8:
         print("\n\n\n")
 
         # ROS Stuff
-        self.bridge = CvBridge()
-        self.server = SimpleActionServer('/object_detector/yolov8', GenericImgProcAnnotatorAction, self.service_call, False)
-
-        self.server.start()
-        print("Server started, waiting for requests...")
-
-    def service_call(self, goal):
-        rgb = goal.rgb
-        width, height = rgb.width, rgb.height
-        assert width == 640 and height == 480
-
+        self.action_server = ActionServer(self, GenericImgProcAnnotator, '/object_detector/yolov8', self.execute_callback)
+        self.get_logger().info(f"YOLOv8 node initialized with weights: {weights}, conf_thres: {self.conf_thres}, iou_thres: {self.iou_thres}, device: {self.device}")
+    
+    def execute_callback(self, goal_handle):
         try:
-            img0 = self.bridge.imgmsg_to_cv2(rgb, "bgr8")
-        except CvBridgeError as e:
-            print(e)
-
-        ros_detections = self.infer(img0, rgb.header) 
-
-        if ros_detections.success:
-            self.server.set_succeeded(ros_detections)
-        else:
-            self.server.set_aborted(ros_detections)
+            self.get_logger().info('Received yolo request')
+            rgb = goal_handle.request.rgb
+            self.get_logger().warning(f"YOLO image topic frame = {rgb.header.frame_id}")
+            width, height = rgb.width, rgb.height
+            cv_image = CvBridge().imgmsg_to_cv2(rgb, desired_encoding='bgr8')
+            # Process results and create response
+            response = self.infer(cv_image, rgb.header)
+            if response.success:
+                self.get_logger().info(">>> SUCCEED <<<")
+                goal_handle.succeed()
+            else:
+                self.get_logger().info(">>> ABORT <<<")
+                goal_handle.abort()
+            self.get_logger().info('YOLO finished')
+            return response
+        except Exception as e:
+            self.get_logger().error(f"Error: {e}")
+            goal_handle.abort()
+            return GenericImgProcAnnotator.Result()
 
     def infer(self, im0s, rgb_header):
         height, width, channels = im0s.shape
@@ -104,6 +106,18 @@ class YOLOv8:
         detections = []
 
         cls = results[0].boxes.cls.cpu().detach().numpy()
+
+        server_result = GenericImgProcAnnotator.Result()
+
+        server_result.success = False
+        server_result.result_feedback = ""
+        server_result.bounding_boxes = []
+        server_result.class_ids = []
+        server_result.class_names = []
+        server_result.class_confidences = []
+        server_result.image = Image()
+        server_result.pose_results = []
+        server_result.descriptions = []
 
         if len(cls):
 
@@ -142,16 +156,14 @@ class YOLOv8:
                     bb.do_rectify = False
                     bboxes.append(bb)
 
-                    confidences.append(conf[idx])
+                    confidences.append(float(conf[idx]))
 
                 if results[0].masks is not None:
                     mask = masks[idx]
                     label_image[mask > 0] = idx
-                 
-            server_result = GenericImgProcAnnotatorResult()
 
             if results[0].masks is not None:
-                mask_image = ros_numpy.msgify(Image, label_image, encoding='16SC1')
+                mask_image = CvBridge().cv2_to_imgmsg(label_image, encoding='16SC1')
                 server_result.image = mask_image
         
             if results[0].boxes is not None:
@@ -162,7 +174,6 @@ class YOLOv8:
             server_result.class_names = class_names
             
         else:
-            server_result = GenericImgProcAnnotatorResult()
             server_result.success = False
 
         return server_result    
@@ -180,14 +191,22 @@ def parse_opt():
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     return opt
 
-# python detect_ros_seg.py --weights ./runs/segment/train10/weights/best.pt --conf-thres 0.9 --camera-topic '$$(rosparam get /pose_estimator/color_topic)'
-if __name__ == "__main__":
-
+def main():
+    rclpy.init()
     try:
-        rospy.init_node('yolov8')
         opt = parse_opt()
-        YOLOv8(**vars(opt))
-        rospy.spin()
-    except rospy.ROSInterruptException:
+        node = YOLOv8(**vars(opt))
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
         pass
+
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+# python detect_ros_seg.py --weights ./runs/segment/train10/weights/best.pt --conf-thres 0.9 --camera-topic '$$(rosparam get /pose_estimator/color_topic)'
 
